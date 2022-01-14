@@ -1,0 +1,23 @@
+#!sh
+#2022-01-07
+
+taskkill /f /im kitty.exe; kitty -kload $(
+e="$(mktemp -p $TEMP)"; 
+# echo 'Protocol\serial\"   >> "$e";
+# echo 'SerialLine\COM3\"   >> "$e";
+echo 'Answerback\\'       >> "$e";
+echo 'AutoWrapMode\1\'       >> "$e";
+echo 'TermWidth\200\'       >> "$e";
+echo 'LineCodePage\ISO-8859-1%3A1998%20(Latin-1,%20West%20Europe)\'       >> "$e";
+echo 'LogFileName\U:/2022-01-07_security_system_communication/kitty_log/kitty_&Y&M&D&T.log\'       >> "$e";
+echo 'LogType\2\'       >> "$e";
+echo 'LogFileClash\0\'       >> "$e";
+echo 'LogFlush\1\'       >> "$e";
+echo 'LogHeader\0\'       >> "$e";
+echo "$(cygpath -w $e)";
+) -serial COM3 -sercfg 9600,8,n,1,N
+
+admin default
+
+sa B@SCHRPSsql12345
+scratchpad\boschsql2017

@@ -1,0 +1,39 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        
+        // the following "fx_task" tasks are intended to be triggered by the
+        // corresponding f key. In order for this to work, you must define
+        // keybindings like the following, which you should place in vs code's
+        // keybindings.json file.: 
+        //     { "key": "f4"  ,  "command":  "workbench.action.tasks.runTask"     ,    "args": "f4_task"    }
+        { "label": "f4_task",            "dependsOn": ["execute_with_python"]                           },
+
+
+
+        {   "label": "execute_with_python",
+            "type":"shell",
+            "command": "${config:python.pythonPath} \"${file}\""
+        },
+
+        {   "label":"python_interactive",
+            "type":"shell",
+            "command": "${config:python.pythonPath}"
+        },
+        {
+            "label":"make_vscode_settings_file",
+            "detail": "",
+            // Programmatically determines the path of the fusion executable and
+            // the path of the debugpy executable (both of which tend to change
+            // as a result of fusion and vscode, respectively, automatically
+            // updating themselves), and inject these paths in the appropriate
+            // place in the vscode settings file.
+            "command": "python", "args":["${workspaceFolder}${pathSeparator}.vscode${pathSeparator}make_vscode_settings_file.py"],
+            "runOptions":{
+                "runOn": "folderOpen"
+            }
+        },
+    ],
+}
