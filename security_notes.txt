@@ -9,7 +9,7 @@ echo 'Answerback\\'       >> "$e";
 echo 'AutoWrapMode\1\'       >> "$e";
 echo 'TermWidth\200\'       >> "$e";
 echo 'LineCodePage\ISO-8859-1%3A1998%20(Latin-1,%20West%20Europe)\'       >> "$e";
-echo 'LogFileName\U:/2022-01-07_security_system_communication/kitty_log/kitty_&Y&M&D&T.log\'       >> "$e";
+echo 'LogFileName\U:/2022-01-07_security_system_communication/logs/kitty_&Y&M&D&T.log\'       >> "$e";
 echo 'LogType\2\'       >> "$e";
 echo 'LogFileClash\0\'       >> "$e";
 echo 'LogFlush\1\'       >> "$e";
