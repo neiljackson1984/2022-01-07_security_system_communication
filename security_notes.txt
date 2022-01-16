@@ -21,3 +21,12 @@ admin default
 
 sa B@SCHRPSsql12345
 scratchpad\boschsql2017
+
+point labels that appear in the "view point status" menu:
+    1. AREA 1   6  
+    2. FIRE                
+    3. FRONT DOOR   
+    4. BACK DOOR      
+    5. FRONT MOTION
+    6. REAR MOTION 
+    7. STOCK MOTION

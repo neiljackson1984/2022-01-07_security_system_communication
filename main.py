@@ -196,6 +196,28 @@ if True: # (region) printableRADXCodePage
     }
 #endregion
 
+def bytesToPrintableRADXString(x : bytes) -> str:
+    return "".join(
+        map(
+            lambda x: 
+                printableRADXCodePage[x & 0b00111111], 
+            x
+        )
+    )
+
+def bytesToHighTwoBitReadableString(x : bytes) -> str:
+    return " ".join(
+        map(
+            lambda x: 
+                {
+                    0b00000000: "--",
+                    0b01000000: "-*",
+                    0b10000000: "*-",
+                    0b11000000: "**",
+                }[x & 0b11000000],
+            x
+        )
+    )
 
 def log(x: str):
     print(x,end='')
@@ -400,6 +422,111 @@ class State:
 # a chunk of data received "At one time" on the serial port.  
 # we hang onto chunks du7ring processing because the chunks contian the timing information.
 
+class KeypadState:
+    def __init__(self, address : int = 0x01):
+        self.address                    : int                = address
+        self.displayReadout             : str                = ""
+        self.bitMapReadout              : str                = ""
+        self.lastReceivedCommand        : bytes              = bytes()
+        self.lastReceivedPayload        : bytes              = bytes()
+
+        self.lastSentCommand            : bytes              = bytes()
+        self.lastNonEmptySentCommand    : bytes              = bytes()
+
+        self.lastReceivedCommand            : bytes              = bytes()
+        self.lastNonEmptyReceivedCommand    : bytes              = bytes()
+
+        self.lastReceivedAudioDirective   : bytes                  = bytes()
+
+        self.lastUpdateTime             : datetime.datetime  = datetime.datetime.now()
+        self._fieldLengths              : Sequence[int]          = []
+        self._reportString              : str                = ""
+
+    def getReportString(self) -> str:
+        return self._reportString
+
+    def update(self, addressAndDirection: int, payload: bytes(), chunks: Optional[Sequence['Chunk']] = None) -> None:
+        if (addressAndDirection & 0x7f) == self.address :
+            self.lastUpdateTime = (chunks[0].arrivalTime if chunks else datetime.datetime.now())
+            direction = ("outOfKeypad" if addressAndDirection & 0x80 else "intoKeypad")
+            if direction == "outOfKeypad":
+                self.lastSentCommand = payload
+                if payload: self.lastNonEmptySentCommand = payload
+            else:
+                # in this case, the direction was intoKeypad.
+                self.lastReceivedPayload = payload
+                
+                # printablePayload, separator, commandPayload = payload.rpartition(b'\x03')
+
+                # separate the payload into a printablePartOfPayload, an audioDirective and a command.
+                # the received payload always takes the form
+                # <printablePartOfPayload> <audioDirective> <command>
+                # I have only ever seen the following audioCommands:
+                # b'\x03' ( 0000 0011 ): silent (the noraml condition)
+                # b'\x0b' ( 0000 1011 ): a two-note falling phrase: G natural, E flat (sounds when a sensor is tripped while the system is armed, before the alarm goes off. often accompanies the message "DISARM NOW")
+                # b'\x07' ( 0000 0111 ): single  E natural (sounds when you enter an invalid code on the keypad.)
+                # b'\x23' ( 0010 0011 ): single  A natural (sounds during the "ARMING...EXIT NOW" countdown) 
+                # b'\x43' ( 0100 0011 ): rapidly-pulsing G sharp. (this sounds continuously when an alarm is going off)
+                # b'\x13' ( 0001 0011 ): rapidly-pulsing E flat (sounds when a door opens while watch mode is enabled )
+
+                # Is suspect that what I am interpreting as the "audio directive" might serve more purpose than just audio control, but who knows.
+                # in addition to the externally-commanded audio that is caused by the audioCommands, the keypad also emits a beep (frequency: B natural)
+                # whenever a key is pressed (and the outgoing buffer is not full).
+
+                audioDirective         = ( payload[:1]  if len(payload) < 4  else payload[-1:] )
+                printablePartOfPayload = ( b''          if len(payload) < 4  else payload[:-1] )
+                command                = ( payload[1:]  if len(payload) < 4  else b''          )
+                # the above algorithm is probably not the same as was originally designed, but it 
+                # seems to work empirically at least for the cases I have encountered.
+
+                
+                if printablePartOfPayload: self.displayReadout = bytesToPrintableRADXString(printablePartOfPayload) 
+
+                self.lastReceivedCommand = command
+                if command: self.lastNonEmptyReceivedCommand = command
+                
+                self.lastReceivedAudioDirective = audioDirective
+
+                if len(payload) > 3 :
+                    self.bitMapReadout = bytesToHighTwoBitReadableString(payload)
+            
+            fieldContentStrings = [
+                f"{self.lastUpdateTime}",
+                ("sent     " if direction == "outOfKeypad" else 
+                 "received "
+                ) + payload.hex(" "), 
+                ("sent     " if direction == "outOfKeypad" else 
+                 "received "
+                ) + bytesToPrintableRADXString(payload), 
+                self.lastReceivedCommand.hex(" "),
+                self.lastNonEmptyReceivedCommand.hex(" "),
+                self.lastSentCommand.hex(" "),
+                self.lastNonEmptySentCommand.hex(" "),
+                self.bitMapReadout,
+                # bytesToPrintableRADXString(self.lastReceivedPayload),
+                self.lastReceivedAudioDirective.hex(" "),
+                self.displayReadout,
+            ]
+
+
+            self._fieldLengths = list(
+                map(max, 
+                    itertools.zip_longest(
+                        self._fieldLengths, 
+                        map(len, fieldContentStrings),
+                        fillvalue=0
+                    )
+                )
+            )
+
+            paddedFields = map(
+                lambda contentString, fieldLength: contentString.ljust(fieldLength),
+                fieldContentStrings,
+                self._fieldLengths
+            )
+
+            self._reportString = " | ".join(paddedFields)
+            changeLog(self._reportString + "\n")
 
 
 class Chunk:
@@ -427,7 +554,8 @@ if __name__ == "__main__":
     serialPort.reset_input_buffer()
 
 
-    state :State = State()
+    # state :State = State()
+    keypadState : KeypadState = KeypadState()
     lastNonemptyChunk : Optional[Chunk] = None
     # iterationIndex = 0
     clusterCount = 0
@@ -510,9 +638,20 @@ if __name__ == "__main__":
         global packetCount
         packetCount += 1
 
+
         declaredChecksum = packetBytes[-1]
         computedChecksum = checksum(packetBytes[0:-1])
         
+        # we probably ought to send any packet with checksum failure to the garbage stream.
+
+        address = packetBytes[0]
+        payload = bytes(packetBytes[2:-1])
+
+        # if address == 0x01 or address == 0x81 :
+        #     printablePayload, separator, commandPayload = payload.rpartition(b'\x03')
+        global keypadState
+        if declaredChecksum == computedChecksum: keypadState.update(address, payload, packetChunks)
+
         fieldContentStrings = [
             # arrival time:
             f"{packetChunks[0].arrivalTime}", 
@@ -530,36 +669,19 @@ if __name__ == "__main__":
                 else bytes((declaredChecksum,)).hex() + "!=" + bytes((computedChecksum,)).hex() ),
             
             # length:
-            f"payload-and-checksum length 0x{len(packetBytes)-2:002x}",
+            f"payloadAndChecksum length 0x{len(payload)+1:002x}",
 
             # byte 0:
-            f"address 0x{packetBytes[0]:002x}" ,
+            f"address 0x{address:002x}" ,
 
-            "payload: " + bytes(packetBytes[2:-1]).hex(" "),
+            "payload " + payload.hex(" "),
 
             
             # upperBitReadoutString:
-            " ".join(
-                map(
-                    lambda x: 
-                        {
-                            0b00000000: "--",
-                            0b01000000: "-*",
-                            0b10000000: "*-",
-                            0b11000000: "**",
-                        }[x & 0b11000000],
-                    packetBytes[2:-1]
-                )
-            ),
+            bytesToHighTwoBitReadableString(payload),
 
             #radxPrintableString:
-            "".join(
-                map(
-                    lambda x: 
-                        printableRADXCodePage[x & 0b00111111], 
-                    packetBytes[2:-1]
-                )
-            ),
+            bytesToPrintableRADXString(payload),
 
 
 
@@ -685,4 +807,4 @@ if __name__ == "__main__":
         # iterationIndex += 1
 
     logFile.close()
-    changeLog.close()
+    changeLogFile.close()
