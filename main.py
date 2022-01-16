@@ -292,7 +292,9 @@ def byteToHumanReadableField(byte : int ) -> str:
             + "  "
         )
 
- 
+def makePacket(address: int, payload: bytes) -> bytes:
+    packetExceptForChecksum = bytes((address, len(payload) + 1, *payload))
+    return bytes((*packetExceptForChecksum, checksum(packetExceptForChecksum)))
 
 
 interClusterThresholdInterval = datetime.timedelta(milliseconds = 150)
@@ -462,16 +464,41 @@ class KeypadState:
                 # the received payload always takes the form
                 # <printablePartOfPayload> <audioDirective> <command>
                 # I have only ever seen the following audioCommands:
-                # b'\x03' ( 0000 0011 ): silent (the noraml condition)
-                # b'\x0b' ( 0000 1011 ): a two-note falling phrase: G natural, E flat (sounds when a sensor is tripped while the system is armed, before the alarm goes off. often accompanies the message "DISARM NOW")
-                # b'\x07' ( 0000 0111 ): single  E natural (sounds when you enter an invalid code on the keypad.)
-                # b'\x23' ( 0010 0011 ): single  A natural (sounds during the "ARMING...EXIT NOW" countdown) 
-                # b'\x43' ( 0100 0011 ): rapidly-pulsing G sharp. (this sounds continuously when an alarm is going off)
-                # b'\x13' ( 0001 0011 ): rapidly-pulsing E flat (sounds when a door opens while watch mode is enabled )
+                # b'\x03' ( 0000 0011 ): 
+                #   silent (the noraml condition)
+
+
+                # b'\x0b' ( 0000 1011 ): 
+                #   a two-note falling phrase: G natural, E flat (sounds when a sensor is tripped while the system is armed, before the alarm goes off. often accompanies the message "DISARM NOW")
+                #   likely match from section 2.3 of the D1255 manual: "Entrance Warning"
+
+                # b'\x07' ( 0000 0111 ): 
+                #   single  E natural (sounds when you enter an invalid code on the keypad.)
+                #   likely match from section 2.3 of the D1255 manual: "Invalid Key Buzz"
+
+                # b'\x23' ( 0010 0011 ): 
+                #   single  A natural (sounds during the "ARMING...EXIT NOW" countdown) 
+                #   likely match from section 2.3 of the D1255 manual: "Exit Warning"
+
+                # b'\x43' ( 0100 0011 ): 
+                #   rapidly-pulsing G sharp. (this sounds continuously when an alarm is going off)
+                #   likely match from section 2.3 of the D1255 manual: "Burglary Signal"
+
+                # b'\x13' ( 0001 0011 ): 
+                #   rapidly-pulsing E flat (sounds when a door opens while watch mode is enabled )
+                #   likely match from section 2.3 of the D1255 manual: "xxxx"
+
+                # b'\x83' ( 1000 0011 ): 
+                #   b flat. Sounds when the "FIRE" alarm is going off.
+                #   likely match from section 2.3 of the D1255 manual: "Fire Signal"
 
                 # Is suspect that what I am interpreting as the "audio directive" might serve more purpose than just audio control, but who knows.
                 # in addition to the externally-commanded audio that is caused by the audioCommands, the keypad also emits a beep (frequency: B natural)
-                # whenever a key is pressed (and the outgoing buffer is not full).
+                # whenever a key is pressed (and the outgoing buffer is not full) (likely match from section 2.3 of the D1255 manual: "Keypad Encoding Tone")
+                # 
+                # unmatched table entries from the list in section 2.3 of the D1255 manual: 
+                # 1. "Watch Tone" (the manual describes this as being the same as the "Entrance Warning" signal, so the code might well be identical)
+                # 2. "Trouble Buzzer" 
 
                 audioDirective         = ( payload[:1]  if len(payload) < 4  else payload[-1:] )
                 printablePartOfPayload = ( b''          if len(payload) < 4  else payload[:-1] )
@@ -650,7 +677,18 @@ if __name__ == "__main__":
         # if address == 0x01 or address == 0x81 :
         #     printablePayload, separator, commandPayload = payload.rpartition(b'\x03')
         global keypadState
-        if declaredChecksum == computedChecksum: keypadState.update(address, payload, packetChunks)
+        if declaredChecksum == computedChecksum: 
+            if address == 0x64 and len(payload) == 1:
+                # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
+                # response = makePacket(0x64 + 0x80, b'\x0e')
+                # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
+                # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
+                response = makePacket(0x65 + 0x80, payload +  b'\x0e')
+                serialPort.write(response)
+                log(f"responding " + response.hex(" ") + "\n")
+            keypadState.update(address, payload, packetChunks)
+
+
 
         fieldContentStrings = [
             # arrival time:
