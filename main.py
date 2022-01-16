@@ -4,6 +4,7 @@ import serial;
 import datetime;
 import pathlib;
 import itertools;
+import sys;
 
 pathOfLogDirectory = pathlib.Path(__file__).parent.joinpath("logs")
 pathOfLogDirectory.mkdir(exist_ok=True)
@@ -220,8 +221,25 @@ def bytesToHighTwoBitReadableString(x : bytes) -> str:
     )
 
 def log(x: str):
-    print(x,end='')
+    # print(x,end='')
     logFile.write(x)
+
+
+def updateStaticOutputLine(x: str, lineNumber: int = 1):
+
+    # writes characters to stdout so as to erase an overwrite the current line of output (rather than writing a whole new line of output)
+    print(
+        "\N{escape}[" + str(lineNumber) + ";1H" 
+        + x,
+        end=''
+    )
+    sys.stdout.flush()
+
+def clearScreen():
+    print(
+        "\N{escape}[2J",
+        end=''
+    )
 
 def changeLog(x: str):
     changeLogFile.write(x)
@@ -247,50 +265,6 @@ def codepointIsPrintable(codepoint : int) -> bool:
     # return 0x20 <= codepoint <= 0x7e # ASCII
     # return 0x00 <= codepoint <= 0x3f  #RADX
     return codepoint in printableRADXCodePage
-
-def byteToHumanReadableField(byte : int ) -> str:
-    # converts a byte into a 4-character human-readable string.
-    # the idea is displaying the sequence of fields generated from a sequence of bytes
-    # will let us easily pick out any human-readable text encoded by those bytes and will let us 
-    # see something menaningful for non-printable characters.
-
-    # the first character in the string is "." or ":" or "!".  The colon is used
-    # when and only when we obtained the printable character code by clearing a
-    # 1 from the high bit of the byte (radionics sometimes seems to encode
-    #  printable characters with a randomly-set (actually probably meaningful)
-    #  high bit). The period indicates a printable character where the high bit
-    #  of the byte was low (i.e. a "properly" encoded ascii printable
-    #  character). The exclamation point indicates that the character was
-    #  non-printable.
-
-    # if a printable character was found, the second and third characters of the string are this printable character followed by a space.
-    # otherwise, the second and third characters of the string are the hex representation of the value.
-    # 
-    # The fourth character of the string is always a space (intended to serve as a separator when a sequence of fields is strung together.
-
-    returnValue : str = ""
-    # highbitIsHigh : bool = byte & 0x80 == 0x80
-    bit7 = (byte >> 7) & 1
-    bit6 = (byte >> 6) & 1
-    candidateCodePoint : int = 0x3f & byte
-
-    if codepointIsPrintable(candidateCodePoint):
-        return (
-            {
-                0b00000000: "--",
-                0b01000000: "-*",
-                0b10000000: "*-",
-                0b11000000: "**",
-            }[byte & 0b11000000]
-            # + bytes((candidateCodePoint,)).decode("ascii") + " " 
-            + printableRADXCodePage[candidateCodePoint] + " " 
-        )
-    else:
-        return (""
-            # + "0x" 
-            + bytes((byte,)).hex() 
-            + "  "
-        )
 
 def makePacket(address: int, payload: bytes) -> bytes:
     packetExceptForChecksum = bytes((address, len(payload) + 1, *payload))
@@ -425,7 +399,7 @@ class State:
 # we hang onto chunks du7ring processing because the chunks contian the timing information.
 
 class KeypadState:
-    def __init__(self, address : int = 0x01):
+    def __init__(self, address : int = 0x01, outputLineNumber : int = 1):
         self.address                    : int                = address
         self.displayReadout             : str                = ""
         self.bitMapReadout              : str                = ""
@@ -444,6 +418,7 @@ class KeypadState:
         self._fieldLengths              : Sequence[int]          = []
         self._reportString              : str                = ""
 
+        self.outputLineNumber = outputLineNumber
     def getReportString(self) -> str:
         return self._reportString
 
@@ -554,7 +529,52 @@ class KeypadState:
 
             self._reportString = " | ".join(paddedFields)
             changeLog(self._reportString + "\n")
+            updateStaticOutputLine(self._reportString, self.outputLineNumber)
 
+class ProgrammerState(KeypadState):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # self.nextResponsePayload = b'\x00\x0e'
+        self.nextResponsePayload = b''
+        self.nextResponseAddress = 0x09 #0x64 + 0x80
+        self.lastResponse : Optional[bytes] = None
+        
+    
+    def update(self, addressAndDirection: int, payload: bytes(), chunks: Optional[Sequence['Chunk']] = None):
+        
+        if (addressAndDirection & 0x7f) == self.address :
+            if addressAndDirection & 0x80:
+                pass
+            else:
+                response = None
+                if payload == b'\x09':
+                    # response = makePacket(self.address + 0x80, self.nextResponsePayload +  b'\x0e')
+                    # response = makePacket(self.address + 0x80, b'\x02\x05\x06' +  b'\x0e')
+                    response = makePacket(self.nextResponseAddress, self.nextResponsePayload )
+                    if self.nextResponsePayload[0] == 0xff:
+                        self.nextResponseAddress = (self.nextResponseAddress + 1) & 0xff
+                    self.nextResponsePayload = bytes( (self.nextResponsePayload[0], (self.nextResponsePayload[1] + 1) & 0xff , *self.nextResponsePayload[2:]) )
+                    # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
+                    # response = makePacket(0x64 + 0x80, b'\x0e')
+                    # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
+                    # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
+
+                    global serialPort
+                    serialPort.write(response)
+                    self.lastResponse = response
+
+                    message = f"{datetime.datetime.now()}: " + "responding " + response.hex(" ")
+                    updateStaticOutputLine(message,5)
+                else:
+                    message = f"{datetime.datetime.now()}: programmer {hex(self.address)} received an unusual payload: " + payload.hex(" ") + ". lastResponse: " + ("None" if self.lastResponse is None else self.lastResponse.hex(" "))
+                    updateStaticOutputLine(message,6)
+                    
+                    
+                    
+            super().update(addressAndDirection, payload, chunks)        
+            log(message + "\n")
+       
+        
 
 class Chunk:
     lastChunkIndex : int = -1
@@ -582,7 +602,8 @@ if __name__ == "__main__":
 
 
     # state :State = State()
-    keypadState : KeypadState = KeypadState()
+    keypadState : KeypadState = KeypadState(address = 0x01, outputLineNumber=2)
+    programmerState : ProgrammerState = ProgrammerState(address = 0x64, outputLineNumber=4)
     lastNonemptyChunk : Optional[Chunk] = None
     # iterationIndex = 0
     clusterCount = 0
@@ -677,16 +698,18 @@ if __name__ == "__main__":
         # if address == 0x01 or address == 0x81 :
         #     printablePayload, separator, commandPayload = payload.rpartition(b'\x03')
         global keypadState
+        global programmerState
         if declaredChecksum == computedChecksum: 
-            if address == 0x64 and len(payload) == 1:
-                # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
-                # response = makePacket(0x64 + 0x80, b'\x0e')
-                # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
-                # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
-                response = makePacket(0x65 + 0x80, payload +  b'\x0e')
-                serialPort.write(response)
-                log(f"responding " + response.hex(" ") + "\n")
+            # if address == 0x64 and len(payload) == 1:
+            #     # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
+            #     # response = makePacket(0x64 + 0x80, b'\x0e')
+            #     # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
+            #     # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
+            #     response = makePacket(0x65 + 0x80, payload +  b'\x0e')
+            #     serialPort.write(response)
+            #     log(f"responding " + response.hex(" ") + "\n")
             keypadState.update(address, payload, packetChunks)
+            programmerState.update(address, payload, packetChunks)
 
 
 
@@ -753,6 +776,8 @@ if __name__ == "__main__":
             + "\n"
         )
 
+        # updateStaticOutputLine(" | ".join(paddedFields))
+
 
     def handleGarbage(garbageBytes: Sequence[int], garbageChunks : Sequence[Chunk]):
         # we might consider inspecting the garbage in search of packets that have a valid length and checksum, but an unknown start byte.
@@ -766,7 +791,7 @@ if __name__ == "__main__":
             + "\n"
         )
         
-
+    clearScreen()
     while True:
         handleChunk(Chunk(serialPort.read_all()))
 
