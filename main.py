@@ -1,20 +1,58 @@
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 import typing
 import serial;
 import datetime;
 import pathlib;
 import itertools;
 import sys;
+# import curses
+import re
+
+
+# thanks to https://stackoverflow.com/questions/2408560/non-blocking-console-input
+# for figuring out how to effectively read stdin in a non-blocking manner:
+import threading
+import queue
+consoleInputQueue = queue.Queue()
+# sys.stdin.reconfigure(line_buffering=False, write_through=True) # these settings don't seem to have any effect -=- the line-buffering might be being performed bny the terminal.
+def collectConsoleInput():
+    global consoleInputQueue
+    while True:
+        # consoleInputQueue.put(sys.stdin.read(1))
+        consoleInputQueue.put(sys.stdin.readline())
+inputThread = threading.Thread(target=collectConsoleInput)
+inputThread.daemon = True
+inputThread.start()
+
 
 pathOfLogDirectory = pathlib.Path(__file__).parent.joinpath("logs")
 pathOfLogDirectory.mkdir(exist_ok=True)
 timeOfLaunch = datetime.datetime.now()
-pathOfLogFile = pathOfLogDirectory.joinpath("log_{:%Y%m%d-%H%M}.txt".format(timeOfLaunch))
+# pathOfLogFile = pathOfLogDirectory.joinpath("log_{:%Y%m%d-%H%M}.txt".format(timeOfLaunch))
+pathOfLogFile = pathOfLogDirectory.joinpath("log.txt")
+if pathOfLogFile.is_file():
+    pathOfLogFile.rename(pathOfLogDirectory.joinpath("log_archived_{:%Y%m%d-%H%M%S}.txt".format(timeOfLaunch)))
 
 
-pathOfChangeLogFile = pathOfLogDirectory.joinpath("change_log_{:%Y%m%d-%H%M}.txt".format(timeOfLaunch))
+# pathOfChangeLogFile = pathOfLogDirectory.joinpath("change_log_{:%Y%m%d-%H%M}.txt".format(timeOfLaunch))
+pathOfChangeLogFile = pathOfLogDirectory.joinpath("change_log.txt")
+if pathOfChangeLogFile.is_file():
+    pathOfChangeLogFile.rename(pathOfLogDirectory.joinpath("change_log_archived_{:%Y%m%d-%H%M%S}.txt".format(timeOfLaunch)))
 
 
+# pin 4 of the programming port (UART data out of control panel (apparently
+# open-drain)) carries the exact same signal that the control panel transmits on
+# the SDI bus, but is not simply a copy of the SDI bus signal in that it does
+# not carry the signal transmitted by other devices besides the panel.  This
+# means, for instance, that pin 4 of the programming port is not suitable for
+# sniffing data sent by devices on the SDI bus other than the control panel
+# itself; if you want to sniff all SDI traffic, it is necessary to connect to
+# the SDI bus itself.  
+# 
+# It seems that everything that the control panel transmits on the SDI bus shows
+# up on port 4 of the programming port, but is the opposite true?  Does
+# everything the control panel transmits on port 4 of the programming port also
+# show up on the SDI bus?  I would guess that the answer is yes.
 
 #region printableRADXCodePage
 if True: # (region) printableRADXCodePage
@@ -229,18 +267,19 @@ def updateStaticOutputLine(x: str, lineNumber: int = 1):
 
     # writes characters to stdout so as to erase an overwrite the current line of output (rather than writing a whole new line of output)
     print(
-        "\N{escape}[" + str(lineNumber) + ";1H" 
-        + x,
+        "\N{escape}[" + str(lineNumber) + ";1H"  # place the cursor at the beginning of the specified line
+        + x
+        + "\N{escape}[K", # clear the remainder of the line
         end=''
     )
     sys.stdout.flush()
 
 def clearScreen():
     print(
-        "\N{escape}[2J",
+        "\N{escape}[1;1H"
+        "\N{escape}[0J",
         end=''
     )
-
 def changeLog(x: str):
     changeLogFile.write(x)
     changeLogFile.flush()
@@ -253,7 +292,7 @@ def checksum(x: Iterable[int]) -> int:
     return 0xff - a
 
 def isStartByte(x: int) -> bool:
-    return x in (0x01, 0x64, 0x81)
+    return x in (0x01, 0x64, 0x81, 0x00, 0x80)
 
 def getExpectedLength(byte0: int, byte1: int) -> int:
     # return (byte1 + 3 if byte0 == 0x81 else byte1 + 2)
@@ -417,6 +456,8 @@ class KeypadState:
         self.lastUpdateTime             : datetime.datetime  = datetime.datetime.now()
         self._fieldLengths              : Sequence[int]          = []
         self._reportString              : str                = ""
+        self.updateCount    : int = 0
+
 
         self.outputLineNumber = outputLineNumber
     def getReportString(self) -> str:
@@ -425,6 +466,7 @@ class KeypadState:
     def update(self, addressAndDirection: int, payload: bytes(), chunks: Optional[Sequence['Chunk']] = None) -> None:
         if (addressAndDirection & 0x7f) == self.address :
             self.lastUpdateTime = (chunks[0].arrivalTime if chunks else datetime.datetime.now())
+            self.updateCount += 1
             direction = ("outOfKeypad" if addressAndDirection & 0x80 else "intoKeypad")
             if direction == "outOfKeypad":
                 self.lastSentCommand = payload
@@ -535,46 +577,133 @@ class ProgrammerState(KeypadState):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # self.nextResponsePayload = b'\x00\x0e'
-        self.nextResponsePayload = b''
-        self.nextResponseAddress = 0x09 #0x64 + 0x80
-        self.lastResponse : Optional[bytes] = None
-        
-    
+        # self.nextResponsePayload = b'\x00\x00\x0e'
+        self.nextTransmissionArguments = [0x64 + 0x80, 0]
+        self.lastTransmission : Optional[bytes] = None
+        self.lastTransmissionThatElicitedUnusualResponse  : Optional[bytes] = None
+        self.responseInterval = 100
+
+
     def update(self, addressAndDirection: int, payload: bytes(), chunks: Optional[Sequence['Chunk']] = None):
-        
         if (addressAndDirection & 0x7f) == self.address :
             if addressAndDirection & 0x80:
+                # in this case, we are seeing a packet that was sent BY the device, not TO the device.
                 pass
-            else:
-                response = None
-                if payload == b'\x09':
-                    # response = makePacket(self.address + 0x80, self.nextResponsePayload +  b'\x0e')
-                    # response = makePacket(self.address + 0x80, b'\x02\x05\x06' +  b'\x0e')
-                    response = makePacket(self.nextResponseAddress, self.nextResponsePayload )
-                    if self.nextResponsePayload[0] == 0xff:
-                        self.nextResponseAddress = (self.nextResponseAddress + 1) & 0xff
-                    self.nextResponsePayload = bytes( (self.nextResponsePayload[0], (self.nextResponsePayload[1] + 1) & 0xff , *self.nextResponsePayload[2:]) )
-                    # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
-                    # response = makePacket(0x64 + 0x80, b'\x0e')
-                    # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
-                    # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
+            # else:
+            #     if payload == b'\x09':
+                    
+            #         if self.updateCount % self.responseInterval == 0:
+            #             # response = makePacket(self.address + 0x80, self.nextResponsePayload +  b'\x0e')
+            #             # response = makePacket(self.address + 0x80, b'\x02\x05\x06' +  b'\x0e')
+            #             thisTransmissionArguments = self.nextTransmissionArguments
+                        
+                        
+            #             transmissionAddress = thisTransmissionArguments[0]
+            #             transmissionPayload = thisTransmissionArguments[1].to_bytes(2, byteorder='big')[1:]
+                        
+            #             # transmissionPayload = b'\x06\x05\x04\x03\x02\x01\x0e'
+            #             # transmissionPayload = b''
+            #             # response = makePacket(transmissionAddress, transmissionPayload)
+            #             self.transmit(destinationAddress = transmissionAddress, payload=transmissionPayload)
+                        
+            #             self.nextTransmissionArguments
 
-                    global serialPort
-                    serialPort.write(response)
-                    self.lastResponse = response
+            #             if thisTransmissionArguments[1] == 0xffff:
+            #                 updateStaticOutputLine(f"{datetime.datetime.now()}: cycle complete",self.outputLineNumber+4)
+            #                 self.nextTransmissionArguments[0] = (thisTransmissionArguments[0] + 1) & 0xff
+            #             self.nextTransmissionArguments[1] = (thisTransmissionArguments[1] + 1) & 0xffff
 
-                    message = f"{datetime.datetime.now()}: " + "responding " + response.hex(" ")
-                    updateStaticOutputLine(message,5)
-                else:
-                    message = f"{datetime.datetime.now()}: programmer {hex(self.address)} received an unusual payload: " + payload.hex(" ") + ". lastResponse: " + ("None" if self.lastResponse is None else self.lastResponse.hex(" "))
-                    updateStaticOutputLine(message,6)
+            #             # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
+            #             # response = makePacket(0x64 + 0x80, b'\x0e')
+            #             # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
+            #             # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
+
+                        
+            #             # global serialPort
+            #             # serialPort.write(response); serialPort.flushOutput()
+            #             # message = f"{datetime.datetime.now()}: " + "transmitting " + response.hex(" ")
+            #             # self.lastTransmission = response
+            #             # updateStaticOutputLine(message,self.outputLineNumber+1)
+            #             # log(message + "\n")
+
+
+            #     else:
+                    
+            #         thisTransmissionThatElicitedUnusualResponse = self.lastTransmission
+
+
+            #         message = (""
+            #             + f"{datetime.datetime.now()}: programmer {hex(self.address)} received an unusual payload: " + payload.hex(" ") 
+            #             + ". lastTransmission: " 
+            #             + ("*" if thisTransmissionThatElicitedUnusualResponse != self.lastTransmissionThatElicitedUnusualResponse else " ")
+            #             + ("None" if self.lastTransmission is None else self.lastTransmission.hex(" "))
+            #         )
+            #         # regex for searching the log: (?<= received an unusual payload: (?!02))([\dabcdef]{2})
+            #         # (?<= received an unusual payload: (?!02))(..)
+            #         # I\r\n\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d.\d\d\d\d\d\d \| 
+            #         # (?<=address (?!(0x01|0x64)))(....)
+
+            #         updateStaticOutputLine(message,self.outputLineNumber+3)
+            #         log(message + "\n")
+
+            #         self.lastTransmissionThatElicitedUnusualResponse  = thisTransmissionThatElicitedUnusualResponse
                     
                     
                     
             super().update(addressAndDirection, payload, chunks)        
-            log(message + "\n")
-       
+        # look for any characters on stdin (which represent keystrokes input by the user), and 
+        # transmit accordingly.
         
+
+        # userInput : Optional[str] = sys.stdin.buffer.read(1)
+        userInput : str = ""
+        # while not consoleInputQueue.empty():
+        #     userInput += consoleInputQueue.get()
+        if not consoleInputQueue.empty():
+            userInput += consoleInputQueue.get()
+        if userInput:
+            userInputLines = userInput.split("\n")
+            firstLineContent = userInputLines[0]
+            
+
+            # re.split()..., below, returns a list wherein the odd-indexed elements are our strings matching the pattern, and the interstitial strings are at the even indices.
+            encodedPayload : List[int] = []
+            for i, value in enumerate(re.split(r'(\\x[\dabcdef]{2})', firstLineContent, flags=re.IGNORECASE)):
+                if i % 2 == 0:
+                    encodedPayload += map(
+                        lambda x: x & 0x3f,
+                        value.encode('ascii')
+                    )
+                else:
+                    encodedPayload.append(int(value[2:], base=16))
+            
+            payloadBytes : bytes = bytes(encodedPayload)
+            # payloadBytes = firstLineContent.encode('unicode_escape')
+            # updateStaticOutputLine(f"{datetime.datetime.now()}: " + "input line 0: " + firstLineContent + " raw bytes: " + userInput.encode("ascii").hex(" ") , self.outputLineNumber+1)
+            updateStaticOutputLine(f"{datetime.datetime.now()}: " + "input line 0: " + firstLineContent + " payloadBytes: " + payloadBytes.hex(" ") + " " +  "printableRADXString: " + bytesToPrintableRADXString(payloadBytes), self.outputLineNumber+1)
+            self.transmit(payloadBytes, rawMode=False)
+        # if userInput:
+        #     updateStaticOutputLine(f"{datetime.datetime.now()}: " + "input: " + userInput, self.outputLineNumber+1)
+        # else:
+        #     updateStaticOutputLine(f"{datetime.datetime.now()}: " + " no input")
+        
+
+
+        if not consoleInputQueue.empty():
+            userInput : str = consoleInputQueue.get()
+            
+
+    def transmit(self, payload : bytes, destinationAddress : Optional[int] = None, rawMode=False) -> None:
+        _destinationAddress = (self.address + 0x80 if destinationAddress is None else destinationAddress)
+        packet = (payload if rawMode else makePacket(_destinationAddress, payload) )    
+
+        message = f"{datetime.datetime.now()}: " + "transmitting " + packet.hex(" ")           
+        global serialPort
+        serialPort.write(packet); serialPort.flushOutput()
+        
+        updateStaticOutputLine(message,self.outputLineNumber+2)
+        log(message + "\n")
+        self.lastTransmission = packet
 
 class Chunk:
     lastChunkIndex : int = -1
@@ -585,7 +714,60 @@ class Chunk:
         # self.index = Chunk.lastChunkIndex + 1
         self.lastChunkIndex = self.index
 
-if __name__ == "__main__":
+
+# logFile
+# changeLogFile
+# serialPort
+keypadState : KeypadState
+device100State  : KeypadState
+programmerState  : ProgrammerState
+lastNonemptyChunk : Optional[Chunk]
+clusterCount : int
+checksumFailureCount : int
+packetCount : int
+garbageCount : int
+bufferOfNonemptyChunks : List[Chunk]
+fieldLengths : List[int]
+packetBytes : List[int] 
+packetChunks : List[Chunk] # the set of chunks from which packetBy
+garbageBytes : List[int] 
+garbageChunks : List[Chunk]  # the set of chunks from which ga
+weAreReadingAPacket : bool 
+targetLengthOfThisPacketIsKnown : bool 
+targetLengthOfThisPacket : int
+logFile : Any
+changeLogFile : Any
+serialPort : Any
+
+
+doDetectClusters : bool = False
+
+
+def main() -> None:
+    global logFile
+    global changeLogFile
+    global serialPort
+    global keypadState
+    global device100State
+    global programmerState
+    global lastNonemptyChunk
+    global clusterCount
+    global checksumFailureCount
+    global packetCount
+    global garbageCount
+    global bufferOfNonemptyChunks
+    global fieldLengths
+    global packetBytes 
+    global packetChunks 
+    global garbageBytes  
+    global garbageChunks 
+    global weAreReadingAPacket 
+    global targetLengthOfThisPacketIsKnown
+    global targetLengthOfThisPacket
+    global doDetectClusters
+    global pathOfLogFile
+    global pathOfChangeLogFile
+
     logFile = open(pathOfLogFile, 'a')
     changeLogFile = open(pathOfChangeLogFile, 'a')
 
@@ -601,20 +783,18 @@ if __name__ == "__main__":
     serialPort.reset_input_buffer()
 
 
-    # state :State = State()
-    keypadState : KeypadState = KeypadState(address = 0x01, outputLineNumber=2)
-    programmerState : ProgrammerState = ProgrammerState(address = 0x64, outputLineNumber=4)
-    lastNonemptyChunk : Optional[Chunk] = None
-    # iterationIndex = 0
+    keypadState  = KeypadState(address = 0x01, outputLineNumber=3)
+    device100State  = KeypadState(address = 0x64, outputLineNumber=8)
+    programmerState = ProgrammerState(address = 0x01, outputLineNumber=13)
+    lastNonemptyChunk = None
     clusterCount = 0
     checksumFailureCount = 0
     packetCount = 0
     garbageCount = 0
-    # iterationIndexOfLastReception = 0
-    # numberOfReceptionsInThisCluster = 0
-    # thisCluster : List[int] = []
-    # timeOfLastReception = datetime.datetime.now()
-    bufferOfNonemptyChunks : List[Chunk] = []
+    bufferOfNonemptyChunks  = []
+    fieldLengths = []
+
+
 
 
     def handleChunk(chunk : Chunk):
@@ -631,39 +811,28 @@ if __name__ == "__main__":
         global clusterCount
         clusterCount += 1
         # byteIterator = iter
-        garbageBytes : List[int] = []
-        garbageChunks : List[Chunk] = [] # the set of chunks from which garbageBytes comes
+        global garbageBytes 
+        global garbageChunks 
 
-        packetBytes : List[int] 
-        packetChunks : List[Chunk] # the set of chunks from which packetBytes comes
+        global packetBytes 
+        global packetChunks 
 
-        weAreReadingAPacket : bool = False
-        targetLengthOfThisPacketIsKnown : bool 
-        targetLengthOfThisPacket : int
+        global weAreReadingAPacket 
+        global targetLengthOfThisPacketIsKnown
+        global targetLengthOfThisPacket 
+
+        garbageBytes  = []
+        garbageChunks  = [] # the set of chunks from which garbageBytes comes
+        weAreReadingAPacket  = False
+
+
+
         
         # we regard the cluster as consisting of an alternating sequence of garbage, packet, garbage, ..., packet, garbage
         # it is distinctly possible that garbageBytes might be part of a real packet, or a packet type that we do not know about, 
         # so we record garabage for later analysis.
         for thisByte, chunk in ( (thisByte, chunk) for chunk in chunks for thisByte in chunk.byteArray):  
-            if (not weAreReadingAPacket) and isStartByte(thisByte):
-                # switch to packet-reading mode, first handling any accumulated garbage.
-                if garbageBytes: handleGarbage(garbageBytes, garbageChunks); garbageBytes = []; garbageChunks = []
-                weAreReadingAPacket = True; packetBytes = []; packetChunks = []; targetLengthOfThisPacketIsKnown = False  
-            
-            if weAreReadingAPacket:
-                packetBytes.append(thisByte); 
-                if chunk not in packetChunks: packetChunks.append(chunk)
-                if (not targetLengthOfThisPacketIsKnown) and len(packetBytes) == 2:
-                    targetLengthOfThisPacket = getExpectedLength(*packetBytes[0:2])
-                    targetLengthOfThisPacketIsKnown = True
-                if targetLengthOfThisPacketIsKnown and len(packetBytes) == targetLengthOfThisPacket:
-                    # switch to garbage-reading mode, first handling the accumulated packet.
-                    handlePacket(packetBytes, packetChunks); packetBytes = []; packetChunks = []; 
-                    weAreReadingAPacket = False; garbageBytes = []; garbageChunks = []
-            else:
-                garbageBytes.append(thisByte)
-                if chunk not in garbageChunks: garbageChunks.append(chunk)
-
+            processInputByte(thisByte, chunk)
         # clean-up:
         if weAreReadingAPacket:
             # yikes: we have hit the end of the cluster without finsihing our packet
@@ -673,7 +842,7 @@ if __name__ == "__main__":
         else:
             if garbageBytes: handleGarbage(garbageBytes, garbageChunks)
 
-    fieldLengths : List[int] = []
+    
 
     def handlePacket(packetBytes : Sequence[int], packetChunks : Sequence[Chunk]):
         # declaredLength = packetBytes[1] + 2
@@ -698,19 +867,10 @@ if __name__ == "__main__":
         # if address == 0x01 or address == 0x81 :
         #     printablePayload, separator, commandPayload = payload.rpartition(b'\x03')
         global keypadState
-        global programmerState
-        if declaredChecksum == computedChecksum: 
-            # if address == 0x64 and len(payload) == 1:
-            #     # response = makePacket(0x64 + 0x80, b'\x06\x05\x04\x03\x02\x01\x0e')
-            #     # response = makePacket(0x64 + 0x80, b'\x0e')
-            #     # response = makePacket(0x64 + 0x80, b'\x09\x09\x0e')
-            #     # response = makePacket(0x65 + 0x80, b'\x01\x02\x05\x06\x08\x0e')
-            #     response = makePacket(0x65 + 0x80, payload +  b'\x0e')
-            #     serialPort.write(response)
-            #     log(f"responding " + response.hex(" ") + "\n")
-            keypadState.update(address, payload, packetChunks)
-            programmerState.update(address, payload, packetChunks)
-
+        global device100State
+        if declaredChecksum != computedChecksum: 
+            global checksumFailureCount
+            checksumFailureCount += 1
 
 
         fieldContentStrings = [
@@ -776,7 +936,12 @@ if __name__ == "__main__":
             + "\n"
         )
 
-        # updateStaticOutputLine(" | ".join(paddedFields))
+        if declaredChecksum == computedChecksum: 
+            keypadState.update(address, payload, packetChunks)
+            device100State.update(address, payload, packetChunks)
+            programmerState.update(address, payload, packetChunks)
+
+        updateStaticOutputLine(f"packetCount: {packetCount:6d}.  checksumFailureCount: {checksumFailureCount:6d}", lineNumber=1)
 
 
     def handleGarbage(garbageBytes: Sequence[int], garbageChunks : Sequence[Chunk]):
@@ -792,82 +957,77 @@ if __name__ == "__main__":
         )
         
     clearScreen()
+    serialPort.reset_input_buffer()
+    
+
+    garbageBytes  = []
+    garbageChunks  = [] 
+    weAreReadingAPacket = False
+
+    
+    def processInputByte(thisByte : int, chunk: Chunk):
+        global weAreReadingAPacket
+        global garbageBytes
+        global garbageChunks
+        global packetBytes
+        global packetChunks
+        global targetLengthOfThisPacketIsKnown
+        global targetLengthOfThisPacket
+
+        if (not weAreReadingAPacket) and isStartByte(thisByte):
+            # switch to packet-reading mode, first handling any accumulated garbage.
+            if garbageBytes: 
+                handleGarbage(garbageBytes, garbageChunks); 
+                garbageBytes = []
+                garbageChunks = []
+
+            weAreReadingAPacket = True; packetBytes = []; packetChunks = []; targetLengthOfThisPacketIsKnown = False  
+        
+
+        if weAreReadingAPacket:
+            packetBytes.append(thisByte); 
+            if chunk not in packetChunks: packetChunks.append(chunk)
+            if (not targetLengthOfThisPacketIsKnown) and len(packetBytes) == 2:
+                targetLengthOfThisPacket = getExpectedLength(*packetBytes[0:2])
+                targetLengthOfThisPacketIsKnown = True
+            if targetLengthOfThisPacketIsKnown and len(packetBytes) == targetLengthOfThisPacket:
+                # switch to garbage-reading mode, first handling the accumulated packet.
+                handlePacket(packetBytes, packetChunks); packetBytes = []; packetChunks = []; 
+                weAreReadingAPacket = False; garbageBytes = []; garbageChunks = []
+        else:
+            garbageBytes.append(thisByte)
+            if chunk not in garbageChunks: garbageChunks.append(chunk)
+
+
+
     while True:
-        handleChunk(Chunk(serialPort.read_all()))
-
-        # if receivedBytes:
-        #     handleChunk(receivedBytes, timeOfThisIteration)
+        chunk = Chunk(serialPort.read_all())
+        
+        if doDetectClusters:
+            handleChunk(Chunk(serialPort.read_all()))
+        else:
+            for thisByte in chunk.byteArray:
+                processInputByte(thisByte, chunk)
             
-        #     iterationIndexOfThisReception = iterationIndex
-        #     timeOfThisReception = timeOfThisIteration
-        #     if(timeOfThisReception - timeOfLastReception > interClusterThresholdInterval):
-        #         # in this case, a new cluster has begun.
-        #         #wrap-up the last cluster:
-        #         log("\n")
-        #         if len(thisCluster)>=7:
-        #             receivedChecksum = thisCluster[-5] 
-        #             receivedStartByte = thisCluster[0] # always 0x01
-        #             receivedDeclaredLengthOfPayloadAndPacketChecksum = thisCluster[1]
-        #             payload = thisCluster[2:-5]
-        #             expectedChecksum = checksum(thisCluster[0:-5])
-                    
-        #             if(receivedChecksum == expectedChecksum):
-        #                 checksumPassed = True
-        #                 pass
-        #                 # print("good checksum!!!!  HOORAY!")
-        #             else:
-        #                 checksumPassed = False
-        #                 checksumFailureCount += 1
-        #                 pass
-        #                 # print("checksum mismatch.")
-                    
-                    
-        #             if len(payload) > 3:k
-        #                 pass
-        #                 # log("\t payload ascii: " + ''.join(map(lambda x: chr(x & 0x7f), payload)) + "\n")
+        # if weAreReadingAPacket:
+        #     # yikes: we have hit the end of the chunk without finsishing our
+        #     # packet this is not indicative of any problem -- there is no
+        #     # guarantee that our serial port input buffer is synchronized with
+        #     # packet boundaries -- but it might be intersting to note.
+        #     pass
+        # else:
+        #     pass
 
-        #             initialChangeCount = state._changeCount
-        #             if checksumPassed:
-        #                 if (receivedDeclaredLengthOfPayloadAndPacketChecksum > 4):
-        #                     if 0x30 <= payload[0] <= 0x39:
-        #                         state.length12AndStartsWithDigit = payload
-        #                     else:
-        #                         state.otherLengthGreaterThanFour = payload
-        #                 else:
-        #                     state.lengthLessThanOrEqualToFour = payload
-
-        #                 if state._changeCount != initialChangeCount:
-        #                     changeLog(f"{state._timeOfLastChange} {checksumFailureCount :7d} {clusterIndex :7d}: {state.getReportString()}\n")
-        #         # possibly, print some statistics (number and time of receptions making up the cluster, a decoding of the cluster, etc.) the last cluster and display a
-        #         # we might consider confirming that a healthy number of iterations
-        #         # has occured within this cluster, to detect the case of an
-        #         # iteration time that is not much smaller than the cluster interval,
-        #         # in which case we are not really saying very much with our cluster
-        #         # divisions.
-
-        #         #initialize the new cluster:
-        #         clusterIndex += 1
-        #         numberOfReceptionsInThisCluster = 0 # to be incremented immediately below in the common reception-handling code
-        #         thisCluster = []
-        #         # print(f"{timeOfThisReception} {iOfThisReception - iOfLastReception :6d}: {receivedBytes.hex( ' ' )}")
-        #         log(f"{timeOfThisReception}: ")
-            
-        #     thisCluster += receivedBytes
+    
+ 
 
 
 
-        #     numberOfReceptionsInThisCluster += 1
-        #     log(receivedBytes.hex(" ") + " ")
 
-        #     if thisCluster[-4:] == [0x64, 0x02, 0x09, 0x90]:
-        #         # serialPort.write(bytes([0x64, 0x02, 0x09, 0x90]))
-        #         # log(" responding ")
-        #         pass
-
-        #     #preparing to continue:
-        #     iterationIndexOfLastReception = iterationIndexOfThisReception
-        #     timeOfLastReception = timeOfThisReception
-        # iterationIndex += 1
-
+ 
+    # to do: put these clean-up statements in a signal handler so they will actually by called:
     logFile.close()
     changeLogFile.close()
+
+if __name__ == "__main__":
+    main()
